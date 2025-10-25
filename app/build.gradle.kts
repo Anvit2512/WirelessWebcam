@@ -52,5 +52,6 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:" + cameraVersion)
     implementation("androidx.camera:camera-view:" + cameraVersion)
 
-    implementation("org.nanohttpd:nanohttpd:2.3.1")
+    // Use the correct nanohttpd-webserver dependency
+    implementation("org.nanohttpd:nanohttpd-webserver:2.3.1")
 }

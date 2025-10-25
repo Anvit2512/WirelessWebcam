@@ -3,10 +3,9 @@ package com.example.wirelesswebcam
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
 import java.io.IOException
-import java.io.InputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
-import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.text.Charsets
 
@@ -17,88 +16,101 @@ class MyWebServer(port: Int) : NanoHTTPD(port) {
     override fun serve(session: IHTTPSession): Response {
         Log.d(TAG, "Request received: ${session.uri}")
 
-        return if (session.uri == "/stream.mjpeg") {
-            // Create a PipedInputStream which will be passed to the response.
-            val pipedInputStream = PipedInputStream()
-            // Create a PipedOutputStream that is connected to the PipedInputStream.
-            // We will write our JPEG frames to this stream in a background thread.
-            val pipedOutputStream = PipedOutputStream(pipedInputStream)
-
-            // Start a background thread to write the MJPEG stream to the PipedOutputStream.
-            // The PipedInputStream will then feed this data to the HTTP response.
-            thread(start = true, name = "MJPEGStreamWriterThread") {
-                writeMjpegStream(pipedOutputStream)
-            }
-
-            // Create the response with the input stream.
-            // For MJPEG, we use newFixedLengthResponse with length -1 (unknown length)
-            // and explicitly set the input stream. This tells NanoHTTPD to stream raw data
-            // from the InputStream without adding its own chunked encoding.
-            val response = newFixedLengthResponse(
-                Response.Status.OK,
-                "multipart/x-mixed-replace; boundary=$BOUNDARY",
-                pipedInputStream,
-                -1 // -1 signifies unknown length for streaming
-            )
-
-            // These headers are still useful for live streaming.
-            response.setKeepAlive(true)
-            response.setGzipEncoding(false) // MJPEG images are already compressed
-
-            response
-
-        } else {
-            newFixedLengthResponse(
+        if (session.uri != "/stream.mjpeg") {
+            return newFixedLengthResponse(
                 Response.Status.OK,
                 "text/plain",
                 "Hello from WirelessWebcam! Open /stream.mjpeg in browser."
             )
         }
+
+        // Pipe for continuous streaming
+        val inPipe = PipedInputStream()
+        val outPipe = PipedOutputStream(inPipe)
+
+        // Writer thread that pushes multipart MJPEG into the pipe
+        val writer = thread(start = true, name = "MJPEGStreamWriter") {
+            writeMjpegStream(outPipe)
+        }
+
+        // Use chunked response for unknown length streaming
+        val resp = newChunkedResponse(
+            Response.Status.OK,
+            "multipart/x-mixed-replace; boundary=$BOUNDARY",
+            inPipe
+        )
+
+        // Live streaming headers
+        resp.addHeader("Cache-Control", "no-cache, no-store, must-revalidate")
+        resp.addHeader("Pragma", "no-cache")
+        resp.addHeader("Expires", "0")
+        resp.addHeader("Connection", "close")
+        resp.setGzipEncoding(false)
+
+        // THE FIX: The setDisposeCallback method does not exist and is not needed.
+        // The try-catch-finally block in writeMjpegStream handles cleanup.
+        // We simply return the response object.
+
+        return resp
     }
 
-    private fun writeMjpegStream(outputStream: PipedOutputStream) {
-        val crlfBytes = "\r\n".toByteArray(Charsets.US_ASCII)
+    private fun writeMjpegStream(output: PipedOutputStream) {
+        val crlf = "\r\n".toByteArray(Charsets.US_ASCII)
+
+        try {
+            // Optional initial boundary to kick some clients
+            output.write(("--$BOUNDARY\r\n").toByteArray(Charsets.US_ASCII))
+            output.flush()
+        } catch (e: IOException) {
+            Log.d(TAG, "Client disconnected before first frame: ${e.message}")
+            return
+        }
+
+        var lastHash = 0
 
         try {
             while (!Thread.interrupted()) {
-                val frame = frames.take() // Blocks until a frame is available
+                val frame = latestJpeg.get()
+                if (frame == null) {
+                    Thread.sleep(10)
+                    continue
+                }
 
-                // Write MJPEG boundary and headers
-                // Note: The header string must be constructed for each frame,
-                // as Content-Length changes per frame.
-                val header = "--$BOUNDARY\r\n" +
-                        "Content-Type: image/jpeg\r\n" +
-                        "Content-Length: ${frame.size}\r\n\r\n" // Double CRLF to end headers
+                val h = java.util.Arrays.hashCode(frame)
+                if (h == lastHash) {
+                    // No new frame; tiny nap to avoid busy loop
+                    Thread.sleep(5)
+                    continue
+                }
+                lastHash = h
 
-                outputStream.write(header.toByteArray(Charsets.US_ASCII))
-                outputStream.write(frame)
-                outputStream.write(crlfBytes) // End of frame with CRLF before next boundary
+                val header = buildString {
+                    append("--").append(BOUNDARY).append("\r\n")
+                    append("Content-Type: image/jpeg\r\n")
+                    append("Content-Length: ").append(frame.size).append("\r\n")
+                    append("\r\n")
+                }.toByteArray(Charsets.US_ASCII)
 
-                outputStream.flush()
+                output.write(header)
+                output.write(frame)
+                output.write(crlf)
+                output.flush()
             }
-        } catch (e: InterruptedException) {
-            Log.d(TAG, "MJPEG stream writer interrupted: ${e.message}")
-            Thread.currentThread().interrupt() // Restore interrupt status
         } catch (e: IOException) {
-            // This is typically how we detect client disconnects (e.g., "Pipe broken")
-            Log.d(TAG, "MJPEG stream I/O error (client likely disconnected): ${e.message}")
+            Log.d(TAG, "MJPEG I/O (client closed?): ${e.message}")
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
         } catch (e: Exception) {
-            Log.e(TAG, "Unexpected error in MJPEG stream writer: ${e.message}")
+            Log.e(TAG, "MJPEG writer error: ${e.message}", e)
         } finally {
-            try {
-                outputStream.close()
-                Log.d(TAG, "MJPEG stream PipedOutputStream closed.")
-            } catch (e: IOException) {
-                Log.e(TAG, "Error closing MJPEG PipedOutputStream: ${e.message}")
-            }
+            try { output.close() } catch (_: IOException) {}
+            Log.d(TAG, "MJPEG stream output closed.")
         }
     }
 
     companion object {
         private const val TAG = "MyWebServer"
-        // Increased queue size. A capacity of 2-5 is often a good balance.
-        // It provides a small buffer without introducing too much lag or memory usage.
-        val frames: ArrayBlockingQueue<ByteArray> = ArrayBlockingQueue(2)
+        // MainActivity should call: MyWebServer.latestJpeg.set(jpegBytes)
+        val latestJpeg: AtomicReference<ByteArray?> = AtomicReference(null)
     }
 }
-//

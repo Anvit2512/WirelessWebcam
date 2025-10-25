@@ -20,9 +20,12 @@ import androidx.core.content.ContextCompat
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.NetworkInterface
+import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.min
 
 class MainActivity : AppCompatActivity() {
 
@@ -56,21 +59,24 @@ class MainActivity : AppCompatActivity() {
 
             val preview = Preview.Builder()
                 .build()
-                .also {
-                    it.setSurfaceProvider(viewFinder.surfaceProvider)
-                }
+                .also { it.setSurfaceProvider(viewFinder.surfaceProvider) }
 
             val imageAnalyzer = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
                 .also { analyzer ->
                     analyzer.setAnalyzer(cameraExecutor) { imageProxy ->
-                        val jpegBytes = imageProxyToJpeg(imageProxy)
-                        jpegBytes?.let {
-                            // Use the correct reference to the frames queue
-                            MyWebServer.frames.offer(it)
+                        try {
+                            val jpeg = imageProxyToJpeg(imageProxy)
+                            if (jpeg != null) {
+                                MyWebServer.latestJpeg.set(jpeg)
+                            }
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "Analyzer error", t)
+                        } finally {
+                            imageProxy.close()
                         }
-                        imageProxy.close()
                     }
                 }
 
@@ -81,7 +87,6 @@ class MainActivity : AppCompatActivity() {
                 cameraProvider.bindToLifecycle(
                     this, cameraSelector, preview, imageAnalyzer
                 )
-
             } catch (exc: Exception) {
                 Log.e(TAG, "Use case binding failed", exc)
             }
@@ -95,26 +100,98 @@ class MainActivity : AppCompatActivity() {
             return null
         }
 
-        val yBuffer = image.planes[0].buffer
-        val uBuffer = image.planes[1].buffer
-        val vBuffer = image.planes[2].buffer
+        val width = image.width
+        val height = image.height
 
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
+        val nv21 = yuv420ToNv21(image)
 
-        val nv21 = ByteArray(ySize + uSize + vSize)
-
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
-
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
+        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
         val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, yuvImage.width, yuvImage.height), 70, out)
-        return out.toByteArray()
+        yuvImage.compressToJpeg(Rect(0, 0, width, height), 80, out)
+        val jpeg = out.toByteArray()
+        out.reset()
+        out.close()
+        return jpeg
     }
 
+    private fun yuv420ToNv21(image: ImageProxy): ByteArray {
+        val width = image.width
+        val height = image.height
+        val ySize = width * height
+        val chromaWidth = width / 2
+        val chromaHeight = height / 2
+        val nv21 = ByteArray(ySize + 2 * chromaWidth * chromaHeight)
+
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+
+        copyPlane(
+            src = yPlane.buffer,
+            rowStride = yPlane.rowStride,
+            pixelStride = yPlane.pixelStride,
+            width = width,
+            height = height,
+            out = nv21,
+            outOffset = 0,
+            outPixelStride = 1
+        )
+
+        val uBuf = uPlane.buffer.duplicate().apply { position(0) }
+        val vBuf = vPlane.buffer.duplicate().apply { position(0) }
+
+        val uRowStride = uPlane.rowStride
+        val vRowStride = vPlane.rowStride
+        val uPixelStride = uPlane.pixelStride
+        val vPixelStride = vPlane.pixelStride
+
+        var outPos = ySize
+        for (row in 0 until chromaHeight) {
+            var uIdx = row * uRowStride
+            var vIdx = row * vRowStride
+            for (col in 0 until chromaWidth) {
+                nv21[outPos++] = vBuf.get(vIdx) // V
+                nv21[outPos++] = uBuf.get(uIdx) // U
+                uIdx += uPixelStride
+                vIdx += vPixelStride
+            }
+        }
+        return nv21
+    }
+
+    private fun copyPlane(
+        src: ByteBuffer,
+        rowStride: Int,
+        pixelStride: Int,
+        width: Int,
+        height: Int,
+        out: ByteArray,
+        outOffset: Int,
+        outPixelStride: Int
+    ) {
+        val srcBuf = src.duplicate()
+        var outPos = outOffset
+        val rowBuffer = ByteArray(rowStride)
+
+        for (row in 0 until height) {
+            val length = min(rowStride, srcBuf.remaining())
+            srcBuf.get(rowBuffer, 0, length)
+
+            if (pixelStride == 1 && outPixelStride == 1) {
+                System.arraycopy(rowBuffer, 0, out, outPos, width)
+                outPos += width
+            } else {
+                var inPos = 0
+                var outColPos = outPos
+                for (col in 0 until width) {
+                    out[outColPos] = rowBuffer[inPos]
+                    outColPos += outPixelStride
+                    inPos += pixelStride
+                }
+                outPos += width * outPixelStride
+            }
+        }
+    }
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
@@ -140,7 +217,11 @@ class MainActivity : AppCompatActivity() {
         try {
             httpServer?.start()
             val ipAddress = getIpAddress()
-            Toast.makeText(this, "Server started at http://$ipAddress:$SERVER_PORT/stream.mjpeg", Toast.LENGTH_LONG).show()
+            Toast.makeText(
+                this,
+                "Server at http://$ipAddress:$SERVER_PORT/stream.mjpeg",
+                Toast.LENGTH_LONG
+            ).show()
             Log.d(TAG, "Server started at http://$ipAddress:$SERVER_PORT/stream.mjpeg")
         } catch (e: IOException) {
             Log.e(TAG, "Error starting server: ${e.message}", e)
@@ -155,25 +236,28 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        cameraExecutor.shutdown()
+        try {
+            cameraExecutor.shutdown()
+        } catch (_: Throwable) {}
         stopServer()
     }
 
     private fun getIpAddress(): String {
-        try {
+        return try {
             val interfaces: List<NetworkInterface> = Collections.list(NetworkInterface.getNetworkInterfaces())
             for (intf in interfaces) {
                 val addrs: List<java.net.InetAddress> = Collections.list(intf.inetAddresses)
                 for (addr in addrs) {
-                    if (!addr.isLoopbackAddress && addr.isSiteLocalAddress && addr is java.net.Inet4Address) { // Only IPv4
+                    if (!addr.isLoopbackAddress && addr.isSiteLocalAddress && addr is java.net.Inet4Address) {
                         return addr.hostAddress ?: "Unknown"
                     }
                 }
             }
+            "Unknown"
         } catch (ex: Exception) {
             Log.e(TAG, "Error getting IP address", ex)
+            "Unknown"
         }
-        return "Unknown"
     }
 
     companion object {
