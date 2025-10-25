@@ -113,5 +113,5 @@ You can tweak the following parameters to adjust performance and quality:
     -   Ensure you have clicked "Start Virtual Camera" in OBS.
     -   Try restarting the conferencing application (Zoom, Meet, etc.) after starting the virtual camera.
 
-## License
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+
+
